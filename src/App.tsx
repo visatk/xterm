@@ -1,6 +1,7 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Terminal } from '@xterm/xterm';
+import { SandboxAddon } from '@cloudflare/sandbox/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -9,7 +10,7 @@ const terminalTheme = {
   foreground: '#10b981', // emerald-500
   cursor: '#10b981', 
   cursorAccent: '#020617',
-  selectionBackground: '#064e3b80', // transparent emerald
+  selectionBackground: '#064e3b80', 
   selectionForeground: '#ffffff',
   selectionInactiveBackground: '#064e3b40',
   black: '#020617', red: '#ef4444', green: '#10b981', yellow: '#eab308',
@@ -43,10 +44,50 @@ export function App() {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const addonRef = useRef<SandboxAddon | null>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // 1. Connect to Collaboration Presence
+  const connectToRoom = useCallback((roomId: string, userName: string) => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/room/${roomId}?name=${encodeURIComponent(userName)}`);
+
+    ws.addEventListener('open', () => {
+      wsRef.current = ws;
+      setState(s => ({ ...s, roomId }));
+      window.history.replaceState({}, '', `?room=${roomId}`);
+    });
+
+    ws.addEventListener('message', (event) => {
+      const message = JSON.parse(event.data);
+      switch (message.type) {
+        case 'connected':
+          setState(s => ({ ...s, connected: true, userId: message.userId, users: message.users, hasActivePty: message.hasActivePty }));
+          break;
+        case 'user_joined':
+        case 'user_left':
+          setState(s => ({ ...s, users: message.users }));
+          break;
+        case 'pty_started':
+          setState(s => ({ ...s, hasActivePty: true }));
+          break;
+        case 'user_typing':
+          setState(s => ({ ...s, typingUser: message.user }));
+          if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = setTimeout(() => setState(s => ({ ...s, typingUser: null })), 1000);
+          break;
+      }
+    });
+
+    ws.addEventListener('close', () => {
+      wsRef.current = null;
+      setState(s => ({ ...s, connected: false, roomId: null, users: [], hasActivePty: false }));
+    });
+  }, []);
+
+  // 2. Initialize Terminal with Cloudflare Native SandboxAddon
   useEffect(() => {
-    if (!state.connected || !terminalRef.current || xtermRef.current) return;
+    if (!state.connected || !terminalRef.current || xtermRef.current || !state.roomId) return;
 
     const term = new Terminal({
       cursorBlink: true, cursorStyle: 'block', cursorWidth: 2, theme: terminalTheme,
@@ -57,85 +98,66 @@ export function App() {
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.loadAddon(new WebLinksAddon());
+
+    // 🚀 NEW: Auto-managed WebSocket connection via SandboxAddon
+    const sandboxAddon = new SandboxAddon({
+      getWebSocketUrl: ({ origin }) => {
+        const wsOrigin = origin.replace(/^http/, 'ws');
+        return `${wsOrigin}/ws/terminal?room=${state.roomId}`;
+      },
+      onStateChange: (terminalState, error) => {
+        if (terminalState === 'disconnected' && error) {
+          term.writeln(`\r\n\x1b[31m[Session Drop: ${error.message}]\x1b[0m`);
+        }
+      }
+    });
+
+    term.loadAddon(sandboxAddon);
     term.open(terminalRef.current);
     
     setTimeout(() => fitAddon.fit(), 0);
     xtermRef.current = term;
+    addonRef.current = sandboxAddon;
 
-    const handleResize = () => {
-      fitAddon.fit();
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'pty_resize', cols: term.cols, rows: term.rows }));
-      }
-    };
-
+    const handleResize = () => fitAddon.fit();
     window.addEventListener('resize', handleResize);
-    return () => { window.removeEventListener('resize', handleResize); term.dispose(); xtermRef.current = null; };
-  }, [state.connected]);
 
-  const handleWsMessage = useCallback((event: MessageEvent) => {
-    const message = JSON.parse(event.data);
-    const term = xtermRef.current;
+    // If session is already booted by another analyst, connect directly
+    if (state.hasActivePty) sandboxAddon.connect({ sandboxId: state.roomId });
 
-    switch (message.type) {
-      case 'connected':
-        setState(s => ({ ...s, connected: true, userId: message.userId, users: message.users, hasActivePty: message.hasActivePty }));
-        if (message.history && term) term.write(message.history);
-        break;
-      case 'user_joined':
-      case 'user_left':
-        setState(s => ({ ...s, users: message.users }));
-        break;
-      case 'pty_started':
-        setState(s => ({ ...s, hasActivePty: true }));
-        break;
-      case 'pty_output':
-        if (term) term.write(message.data);
-        break;
-      case 'pty_exit':
-        setState(s => ({ ...s, hasActivePty: false }));
-        if (term) term.writeln(`\r\n\x1b[31m[Session Terminated: Code ${message.exitCode}]\x1b[0m`);
-        break;
-      case 'user_typing':
-        setState(s => ({ ...s, typingUser: message.user }));
-        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-        typingTimeoutRef.current = setTimeout(() => setState(s => ({ ...s, typingUser: null })), 1000);
-        break;
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      sandboxAddon.disconnect();
+      term.dispose();
+      xtermRef.current = null;
+      addonRef.current = null;
+    };
+  }, [state.connected, state.roomId]);
+
+  // Connect native terminal when PTY starts
+  useEffect(() => {
+    if (state.hasActivePty && addonRef.current && state.roomId) {
+      addonRef.current.connect({ sandboxId: state.roomId });
     }
-  }, []);
+  }, [state.hasActivePty, state.roomId]);
 
-  const connectToRoom = useCallback((roomId: string, userName: string) => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/room/${roomId}?name=${encodeURIComponent(userName)}`);
-
-    ws.addEventListener('open', () => {
-      wsRef.current = ws;
-      setState(s => ({ ...s, roomId }));
-      window.history.replaceState({}, '', `?room=${roomId}`);
-    });
-    ws.addEventListener('message', handleWsMessage);
-    ws.addEventListener('close', () => {
-      wsRef.current = null;
-      setState(s => ({ ...s, connected: false, roomId: null, users: [], hasActivePty: false }));
-    });
-  }, [handleWsMessage]);
-
-  const startPty = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN && xtermRef.current) {
-      wsRef.current.send(JSON.stringify({ type: 'start_pty', cols: xtermRef.current.cols, rows: xtermRef.current.rows }));
-    }
-  }, []);
-
+  // Send typing event indicator to peers
   useEffect(() => {
     const term = xtermRef.current;
     if (!term) return;
-    const disposable = term.onData((data: string) => {
+    const disposable = term.onData(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN && state.hasActivePty) {
-        wsRef.current.send(JSON.stringify({ type: 'pty_input', data }));
+        wsRef.current.send(JSON.stringify({ type: 'user_typing' }));
       }
     });
     return () => disposable.dispose();
   }, [state.hasActivePty]);
+
+  const startPty = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'start_pty' }));
+    }
+  }, []);
 
   const createRoom = async () => {
     const name = joinName.trim() || `OP-${generateId()}`;
@@ -157,7 +179,6 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50 font-sans relative overflow-hidden flex flex-col selection:bg-emerald-500/30">
-      {/* Network Grid Background */}
       <div className="fixed inset-0 pointer-events-none bg-[image:linear-gradient(rgba(16,185,129,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.03)_1px,transparent_1px)] bg-[size:40px_40px]" />
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(16,185,129,0.1),transparent)]" />
 
@@ -182,7 +203,7 @@ export function App() {
             </h1>
             
             <p className="text-base text-slate-400 max-w-[500px] mb-12">
-              Encrypted, collaborative session for real-time threat monitoring, vulnerability assessment, and EPICSecBot event investigations.
+              Encrypted, collaborative session for real-time threat monitoring, vulnerability assessment, and zero-day investigations.
             </p>
 
             <div className="bg-slate-900/80 border border-emerald-900/50 rounded-lg p-8 w-full max-w-md backdrop-blur-xl shadow-2xl">
