@@ -25,13 +25,10 @@ function randomColor(): string {
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
-// Room DO now strictly handles Collaboration Presence (who is here, who is typing)
 export class Room implements DurableObject {
   private clients: Map<string, { ws: WebSocket; info: UserInfo }> = new Map();
   private hasActivePty: boolean = false;
 
-  // FIX: Removed 'private' modifier to comply with 'erasableSyntaxOnly'
-  // Prefixed with '_' to ignore unused variable warning
   constructor(_ctx: DurableObjectState, _env: Env) {}
 
   private broadcast(message: object, excludeUserId?: string): void {
@@ -63,6 +60,10 @@ export class Room implements DurableObject {
         if (msg.type === 'start_pty') {
           this.hasActivePty = true;
           this.broadcast({ type: 'pty_started' });
+        } else if (msg.type === 'pty_exited') {
+          // If a client reports the container died, sync state to all clients
+          this.hasActivePty = false;
+          this.broadcast({ type: 'pty_exited' });
         } else if (msg.type === 'user_typing') {
           this.broadcast({ type: 'user_typing', user: userInfo }, userId);
         }
@@ -74,6 +75,7 @@ export class Room implements DurableObject {
       this.broadcast({ type: 'user_left', userId, users: Array.from(this.clients.values()).map(c => c.info) });
     });
 
+    // Initial Sync
     server.send(JSON.stringify({
       type: 'connected',
       userId,
@@ -103,16 +105,15 @@ export default {
       const sandbox = getSandbox(env.Sandbox, `sandbox-${roomId}`);
       const PS1 = '\\[\\e[38;5;196m\\]root\\[\\e[0m\\]@\\[\\e[38;5;46m\\]sec-ops\\[\\e[0m\\] \\[\\e[38;5;51m\\]\\w\\[\\e[0m\\] \\[\\e[38;5;196m\\]#\\[\\e[0m\\] ';
 
-      // FIX: Bypass TypeScript type-checking for the missing .terminal() definition in @cloudflare/sandbox
       // @ts-ignore
       return sandbox.terminal(request, {
         command: ['/bin/bash', '--norc', '--noprofile'],
-        cwd: '/home/sec-admin',
+        cwd: '/workspace', // FIX: Align with Dockerfile
         env: {
           TERM: 'xterm-256color',
           COLORTERM: 'truecolor',
           LANG: 'en_US.UTF-8',
-          HOME: '/home/sec-admin',
+          HOME: '/workspace', // FIX: Align with Dockerfile
           USER: 'root',
           PS1,
           HISTFILE: '/dev/null',
